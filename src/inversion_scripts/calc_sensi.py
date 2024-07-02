@@ -6,6 +6,8 @@ import numpy as np
 import xarray as xr
 from joblib import Parallel, delayed
 
+import itertools
+
 
 def zero_pad_num(n):
     nstr = str(n)
@@ -183,101 +185,80 @@ def calc_sensi(
             pert_simulations_dict[run_num] = [sv_elem]
         else:
             pert_simulations_dict[run_num].append(sv_elem)
+            
+            
+    # generate arguments for parallel call
+    arg_prod = itertools.product(days, pert_simulations_dict.keys())
+    par_args = [i for i in arg_prod]
     
-    # For each day
-    for d in days:
-        # Load the base run SpeciesConc file
-        prior = xr.load_dataset(
-            f"{run_dirs_pth}/{run_name}_0000/OutputDir/GEOSChem.SpeciesConc.{d}_0000z.nc4"
+    def process(day, run_num):
+    
+        inf = (
+            f'{basedir}/jacobian_runs/
+            f'{run_name}_{run_num}/OutputDir/'
+            f'GEOSChem.SpeciesConc.{day}_0000z.nc4'
         )
-        bc_base = xr.load_dataset(
-            f"{run_dirs_pth}/{run_name}_0001/OutputDir/GEOSChem.SpeciesConc.{d}_0000z.nc4"
-        )
-        # Count nlat, nlon, nlev
-        nlon = len(prior["lon"])  # 52
-        nlat = len(prior["lat"])  # 61
-        nlev = len(prior["lev"])  # 47
+        ds = xr.load_dataset(inf)
+    
+        # loop each sv element tracer in a file
+        for sv_elem in pert_simulations_dict[run_num]:
 
-        # For each hour
-        def process(h):
-            # Initialize sensitivities array
-            sensi = np.empty((nelements, nlev, nlat, nlon))
-            sensi.fill(np.nan)
+            # var name of tracer
+            elem = str(sv_elem).zfill(4)
+            sv_elem_name = f'SpeciesConcVV_CH4_{elem}'
+            e_idx = sv_elem - 1
 
-            # Loop through each perturbation simulation
-            for run_num in pert_simulations_dict.keys():
-                # Load the SpeciesConc file for the current pert simulation and day
-                pert_data = xr.open_dataset(
-                    f"{run_dirs_pth}/{run_name}_{run_num}/OutputDir/GEOSChem.SpeciesConc.{d}_0000z.nc4"
+            # booleans for whether this element is a BC element or OH element
+            is_OH_element = check_is_OH_element(sv_elem, nelements, opt_OH)
+
+            is_BC_element = check_is_BC_element(
+                sv_elem, nelements, opt_OH, opt_BC, is_OH_element
+            )
+
+            # Get the data for the current hour
+            key = (
+                "SpeciesConcVV_CH4"
+                if is_OH_element or is_BC_element
+                else f"SpeciesConcVV_CH4_{elem}"
+            )
+
+            if is_OH_element:
+                prior = xr.load_dataset(
+                    f"{run_dirs_pth}/{run_name}_0000/OutputDir/GEOSChem.SpeciesConc.{day}_0000z.nc4"
+                )
+                ds_diff = (ds[key] - prior['SpeciesConcVV_CH4']) / perturbationOH
+            elif is_BC_element:
+                bc_base = xr.load_dataset(
+                    f"{run_dirs_pth}/{run_name}_0001/OutputDir/GEOSChem.SpeciesConc.{day}_0000z.nc4"
+                )
+                ds_diff = (ds[key] - bc_base['SpeciesConcVV_CH4']) / perturbationBC
+            else:
+                ds_diff = (ds[key] - ds['SpeciesConcVV_CH4']) / perturbation[e_idx]
+
+
+            for h in range(len(ds_diff.time)):
+                if is_BC_element:
+                    if h != 0:
+                        test_GC_output_for_BC_perturbations(
+                            e_idx, nelements, ds_diff.isel(time=h).values, opt_OH
+                        )       
+                outdir = f'{basedir}/inversion/data_sensitivities/{day}_{h:02}'
+                os.makedirs(outdir, exist_ok=True)
+                outf = f'{outdir}/sensi_{day}_{h:02}_{elem}.nc'
+                outds = (
+                    ds_diff
+                    .isel(time=h)
+                    .expand_dims('element',0)
+                    .drop_vars('time')
+                    .assign_coords({'element':[e_idx]})
+                    .to_dataset(name='Sensitivities')
                 )
 
-                # For each state vector element in the loaded simulation
-                for sv_elem in pert_simulations_dict[run_num]:
-                    e_idx = sv_elem - 1
-                    elem = str(sv_elem).zfill(4)
+                outds.to_netcdf(
+                    outf,
+                    encoding = {v: {'complevel':1, 'zlib':True} for v in outds.data_vars}
+                )
 
-                    # booleans for whether this element is a BC element or OH element
-                    is_OH_element = check_is_OH_element(sv_elem, nelements, opt_OH)
-
-                    is_BC_element = check_is_BC_element(
-                        sv_elem, nelements, opt_OH, opt_BC, is_OH_element
-                    )
-
-                    # Get the data for the current hour
-                    key = (
-                        "SpeciesConcVV_CH4"
-                        if is_OH_element or is_BC_element
-                        else f"SpeciesConcVV_CH4_{elem}"
-                    )
-                    pert = pert_data[key][h, :, :, :]
-
-                    # Compute and store the sensitivities
-                    if is_OH_element:
-                        # Get the base run data for the hour
-                        oh_base = prior["SpeciesConcVV_CH4"][h, :, :, :]
-                        # calculate OH sensitivities
-                        sensitivities = (pert.values - oh_base.values) / perturbationOH
-                    elif is_BC_element:
-                        pert_base = bc_base[f"SpeciesConcVV_CH4"][h, :, :, :]
-                        # calculate BC sensitivities
-                        sensitivities = (
-                            pert.values - pert_base.values
-                        ) / perturbationBC
-
-                        # because we take the first hour on the first day from spinup
-                        if h != 0:
-                            test_GC_output_for_BC_perturbations(
-                                e_idx, nelements, sensitivities, opt_OH
-                            )
-                    else:
-                        pert_base = pert_data["SpeciesConcVV_CH4"][h, :, :, :]
-                        # Calculate emission perturbations
-                        sensitivities = (pert.values - pert_base.values) / perturbation[
-                            e_idx
-                        ]
-                    sensi[e_idx, :, :, :] = sensitivities
-
-                # close pert data file to reduce memory load
-                pert_data.close()
-            # Save sensi as netcdf with appropriate coordinate variables
-            sensi = xr.DataArray(
-                sensi,
-                coords=(
-                    np.arange(1, nelements + 1),
-                    np.arange(1, nlev + 1),
-                    prior.lat,
-                    prior.lon,
-                ),
-                dims=["element", "lev", "lat", "lon"],
-                name="Sensitivities",
-            )
-            sensi = sensi.to_dataset()
-            sensi.to_netcdf(
-                f"{sensi_save_pth}/sensi_{d}_{str(h).zfill(2)}.nc",
-                encoding={
-                    v: {"zlib": True, "complevel": 9} for v in sensi.data_vars
-                },
-            )
 
         results = Parallel(n_jobs=-1)(delayed(process)(hour) for hour in hours)
     print(f"Saved GEOS-Chem sensitivity files to {sensi_save_pth}")

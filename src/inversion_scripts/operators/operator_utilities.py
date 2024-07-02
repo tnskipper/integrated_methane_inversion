@@ -1,6 +1,7 @@
 import numpy as np
 import xarray as xr
 import pandas as pd
+from glob import glob
 
 # common utilities for using different operators
 
@@ -52,7 +53,14 @@ def read_geoschem(date, gc_cache, build_jacobian=False, sensi_cache=None):
 
     # If need to construct Jacobian, read sensitivity data from GEOS-Chem perturbation simulations
     if build_jacobian:
-        sensitivity_data = xr.open_dataset(f"{sensi_cache}/sensi_{date}.nc")
+        
+        # get list of files
+        sensi_files = sorted(glob(f"{sensi_cache}/sensi_{date}/*.nc"))
+        
+        # open and concat files
+        sensi_data_list = [xr.load_dataset(inf) for in in sensi_files]
+        sensitivity_data = xr.concat(sensi_data_list, 'element')
+        
         sensitivities = sensitivity_data["Sensitivities"].values
         # Reshape so the data have dimensions (lon, lat, lev, grid_element)
         sensitivities = np.einsum("klji->ijlk", sensitivities)
