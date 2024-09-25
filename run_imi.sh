@@ -2,8 +2,8 @@
 
 #SBATCH -N 1
 #SBATCH -c 1
-#SBATCH --mem=2000
-#SBATCH -t 12:00:00
+# SBATCH --mem=2000
+#SBATCH -t 72:00:00
 #SBATCH -p singlepe
 #SBATCH -A mod3dev
 #SBATCH -o "imi_output_%j.log"
